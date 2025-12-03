@@ -5,11 +5,11 @@ import google.generativeai as genai
 
 class GeminiPDFService:
     """
-    Gemini API integration - ONLY used for PDF operations:
-    - Search inside PDFs
-    - Extract relevant text
-    - Summarize content
-    - Lookup facts inside documents
+    Gemini API integration - ONLY used for PDF search operations:
+    - Matches PDF filenames/titles to query for relevance prioritization
+    - Searches PDFs one by one in order of relevance
+    - Stops early when information is found (early stopping)
+    - Processes long PDFs in chunks instead of truncating
     """
     
     def __init__(self, api_key: Optional[str] = None):
@@ -58,9 +58,144 @@ class GeminiPDFService:
         except Exception as e:
             raise Exception(f"Error reading PDF: {str(e)}")
     
-    def search_in_pdf(self, pdf_path: str, query: str) -> Dict[str, Any]:
+    def _find_all_pdfs(self, uploads_dir: str) -> list:
+        """Find all PDF files in the uploads directory."""
+        pdf_files = []
+        if os.path.exists(uploads_dir):
+            for file in os.listdir(uploads_dir):
+                if file.lower().endswith('.pdf'):
+                    pdf_files.append(os.path.join(uploads_dir, file))
+        return pdf_files
+    
+    def _match_pdfs_by_title(self, pdf_files: list, query: str) -> list:
+        """Sort PDFs by relevance to query based on filename matching."""
+        query_lower = query.lower()
+        query_words = set(query_lower.split())
+        
+        scored_pdfs = []
+        
+        for pdf_path in pdf_files:
+            filename = os.path.basename(pdf_path)
+            filename_lower = filename.lower()
+            filename_no_ext = filename_lower.replace('.pdf', '')
+            
+            # Score based on keyword matches in filename
+            score = 0
+            
+            # Check for exact phrase match
+            if query_lower in filename_no_ext:
+                score += 100
+            
+            # Check for word matches
+            filename_words = set(filename_no_ext.replace('_', ' ').replace('-', ' ').split())
+            common_words = query_words.intersection(filename_words)
+            score += len(common_words) * 10
+            
+            # Check for partial word matches
+            for qword in query_words:
+                for fword in filename_words:
+                    if qword in fword or fword in qword:
+                        score += 5
+            
+            scored_pdfs.append((score, pdf_path))
+        
+        # Sort by score (highest first) and return paths
+        scored_pdfs.sort(key=lambda x: x[0], reverse=True)
+        return [pdf_path for _, pdf_path in scored_pdfs]
+    
+    def _split_text_into_chunks(self, text: str, chunk_size: int = 50000, overlap: int = 5000) -> list:
+        """Split long text into overlapping chunks to avoid truncation."""
+        if len(text) <= chunk_size:
+            return [text]
+        
+        chunks = []
+        start = 0
+        
+        while start < len(text):
+            end = start + chunk_size
+            chunk = text[start:end]
+            
+            # Try to break at sentence boundary if not last chunk
+            if end < len(text):
+                # Look for sentence endings within the last 2000 chars
+                last_period = chunk.rfind('.', -2000)
+                last_newline = chunk.rfind('\n', -2000)
+                break_point = max(last_period, last_newline)
+                
+                if break_point > start + chunk_size // 2:  # Only break if we get at least half a chunk
+                    chunk = chunk[:break_point + 1]
+                    end = start + break_point + 1
+            
+            chunks.append(chunk)
+            
+            # Move start with overlap
+            start = end - overlap
+        
+        return chunks
+    
+    def _search_single_pdf(self, pdf_path: str, query: str) -> Dict[str, Any]:
+        """Search a single PDF and return results."""
+        try:
+            pdf_text = self._read_pdf(pdf_path)
+            pdf_name = os.path.basename(pdf_path)
+            
+            # If PDF is too long, process in chunks
+            max_chunk_size = 50000
+            chunks = self._split_text_into_chunks(pdf_text, max_chunk_size)
+            
+            # Search each chunk
+            for chunk_idx, chunk in enumerate(chunks):
+                prompt = f"""You are analyzing a PDF document. The user wants to search for: "{query}"
+
+PDF Content (Part {chunk_idx + 1} of {len(chunks)}):
+{chunk}
+
+Task: Search through this PDF content and find information related to "{query}".
+- If you find relevant information, provide a one line answer with inline citations in APA 7th edition formatting.
+- If no relevant information is found in this chunk, respond with "NO_RELEVANT_INFO".
+- Do not use any formatting, bullet points, or line breaks."""
+
+                response = self.model.generate_content(prompt)
+                result_text = response.text.strip()
+                
+                # Check if we found relevant information
+                if result_text.upper() != "NO_RELEVANT_INFO" and len(result_text) > 20:
+                    # Found information - check if it's complete
+                    return {
+                        "success": True,
+                        "query": query,
+                        "results": result_text,
+                        "pdf_path": pdf_path,
+                        "pdf_name": pdf_name,
+                        "chunk_searched": chunk_idx + 1,
+                        "total_chunks": len(chunks),
+                        "found_in_chunk": True,
+                        "operation": "search"
+                    }
+            
+            # No relevant info found in this PDF
+            return {
+                "success": False,
+                "found_in_pdf": False,
+                "pdf_name": pdf_name,
+                "operation": "search"
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "pdf_name": os.path.basename(pdf_path),
+                "operation": "search"
+            }
+    
+    def search_all_pdfs(self, query: str, uploads_dir: Optional[str] = None) -> Dict[str, Any]:
         """
-        Search for information inside a PDF using Gemini.
+        Search for information across PDFs in the uploads directory.
+        - First matches PDF filenames to query for relevance
+        - Searches PDFs one by one in order of relevance
+        - Stops early when information is found
+        - Processes long PDFs in chunks
         """
         if not self.model:
             return {
@@ -69,174 +204,54 @@ class GeminiPDFService:
                 "operation": "search"
             }
         
-        try:
-            pdf_text = self._read_pdf(pdf_path)
-            
-            prompt = f"""You are analyzing a PDF document. The user wants to search for: "{query}"
-
-PDF Content:
-{pdf_text[:50000]}  # Limit to ~50k chars to avoid token limits
-
-Task: Search through the PDF content and identify:
-1. Where the information related to "{query}" appears (page numbers, sections)
-2. Relevant excerpts or passages
-3. Context around the found information
-
-Provide a one line answer with the attached in line citation with APA 7th edition formatting. Do not use any formatting or bullet points"""
-
-            response = self.model.generate_content(prompt)
-            
+        # Determine uploads directory
+        if not uploads_dir:
+            uploads_dir = os.path.join(os.path.dirname(__file__), 'uploads')
+        
+        # Find all PDFs
+        all_pdf_files = self._find_all_pdfs(uploads_dir)
+        
+        if not all_pdf_files:
             return {
-                "success": True,
-                "query": query,
-                "pdf_path": pdf_path,
-                "results": response.text,
+                "success": False,
+                "error": "No PDF files found in the uploads directory.",
                 "operation": "search"
             }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "operation": "search"
-            }
-    
-    def extract_relevant_text(self, pdf_path: str, query: str) -> Dict[str, Any]:
-        """
-        Extract relevant text from PDF based on query using Gemini.
-        """
-        if not self.model:
-            return {
-                "success": False,
-                "error": "Gemini API not initialized. Please set GEMINI_API_KEY environment variable.",
-                "operation": "extract"
-            }
         
-        try:
-            pdf_text = self._read_pdf(pdf_path)
-            
-            prompt = f"""You are extracting specific information from a PDF document.
-
-User's request: "{query}"
-
-PDF Content:
-{pdf_text[:50000]}
-
-Task: Extract the most relevant text passages that directly relate to the user's request. 
-Provide:
-1. The extracted text excerpts
-2. Page numbers where they appear
-3. Brief context if needed
-
-Focus on accuracy and relevance to the user's query."""
-
-            response = self.model.generate_content(prompt)
-            
-            return {
-                "success": True,
-                "query": query,
-                "pdf_path": pdf_path,
-                "extracted_text": response.text,
-                "operation": "extract"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "operation": "extract"
-            }
-    
-    def summarize_content(self, pdf_path: str, query: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Summarize PDF content using Gemini.
-        If query is provided, create a focused summary related to that topic.
-        """
-        if not self.model:
-            return {
-                "success": False,
-                "error": "Gemini API not initialized. Please set GEMINI_API_KEY environment variable.",
-                "operation": "summarize"
-            }
+        # Match PDFs by title/filename to prioritize relevant ones
+        matched_pdfs = self._match_pdfs_by_title(all_pdf_files, query)
         
-        try:
-            pdf_text = self._read_pdf(pdf_path)
-            
-            if query:
-                prompt = f"""Summarize the PDF document with a focus on: "{query}"
-
-PDF Content:
-{pdf_text[:50000]}
-
-Task: Create a concise summary that highlights information related to "{query}". 
-Include key points, main findings, and relevant details."""
-            else:
-                prompt = f"""Summarize the following PDF document:
-
-PDF Content:
-{pdf_text[:50000]}
-
-Task: Create a comprehensive summary including:
-1. Main topics and themes
-2. Key points and findings
-3. Important details
-4. Overall document structure"""
-
-            response = self.model.generate_content(prompt)
-            
-            return {
-                "success": True,
-                "pdf_path": pdf_path,
-                "summary": response.text,
-                "focus": query if query else "general",
-                "operation": "summarize"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "operation": "summarize"
-            }
-    
-    def lookup_facts(self, pdf_path: str, query: str) -> Dict[str, Any]:
-        """
-        Lookup specific facts or information in the PDF using Gemini.
-        """
-        if not self.model:
-            return {
-                "success": False,
-                "error": "Gemini API not initialized. Please set GEMINI_API_KEY environment variable.",
-                "operation": "lookup"
-            }
+        # Search PDFs one by one, stopping when we find information
+        pdfs_searched = 0
+        searched_pdf_names = []
         
-        try:
-            pdf_text = self._read_pdf(pdf_path)
+        for pdf_path in matched_pdfs:
+            pdf_name = os.path.basename(pdf_path)
+            searched_pdf_names.append(pdf_name)
+            pdfs_searched += 1
             
-            prompt = f"""Look up facts and information related to: "{query}"
-
-PDF Content:
-{pdf_text[:50000]}
-
-Task: Find and extract factual information related to "{query}" from the PDF.
-Provide:
-1. Direct answers to the query
-2. Supporting facts and evidence
-3. Page references where available
-4. Any related information that might be relevant
-
-Be precise and cite specific information from the document."""
-
-            response = self.model.generate_content(prompt)
+            # Search this PDF
+            result = self._search_single_pdf(pdf_path, query)
             
-            return {
-                "success": True,
-                "query": query,
-                "pdf_path": pdf_path,
-                "facts": response.text,
-                "operation": "lookup"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "operation": "lookup"
-            }
+            # If we found relevant information, return immediately
+            if result.get("success") and result.get("found_in_chunk"):
+                result["pdfs_searched"] = pdfs_searched
+                result["pdfs_total"] = len(all_pdf_files)
+                return result
+            
+            # If there was an error reading this PDF, continue to next one
+            if result.get("error"):
+                print(f"Warning: Error searching {pdf_name}: {result.get('error')}")
+                continue
+        
+        # If we searched all PDFs and found nothing
+        return {
+            "success": False,
+            "query": query,
+            "error": "No relevant information found in any of the PDF documents.",
+            "pdfs_searched": pdfs_searched,
+            "pdfs_total": len(all_pdf_files),
+            "searched_pdf_names": searched_pdf_names,
+            "operation": "search"
+        }
 

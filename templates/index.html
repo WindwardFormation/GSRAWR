@@ -223,7 +223,7 @@
             <input 
                 type="text" 
                 id="messageInput" 
-                placeholder="Type your message here... (e.g., 'Search for machine learning in document.pdf')"
+                placeholder="Type your message here..."
                 autocomplete="off"
             >
             <button id="sendButton" onclick="sendMessage()">Send</button>
@@ -264,11 +264,14 @@
         }
 
         function showTyping() {
-            typingIndicator.classList.add('active');
+            // Create a new typing indicator for the chat (don't use the original one)
             const typingDiv = document.createElement('div');
             typingDiv.className = 'message bot';
             typingDiv.id = 'typingMessage';
-            typingDiv.appendChild(typingIndicator.cloneNode(true));
+            
+            const typingIndicatorClone = typingIndicator.cloneNode(true);
+            typingIndicatorClone.classList.add('active');
+            typingDiv.appendChild(typingIndicatorClone);
             chatMessages.appendChild(typingDiv);
             chatMessages.scrollTop = chatMessages.scrollHeight;
         }
